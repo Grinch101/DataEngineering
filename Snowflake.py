@@ -1,3 +1,236 @@
+import datetime as dt
+import gzip
+import io
+import logging
+import os
+import tempfile
+from typing import Optional, Dict, List
+
+import pandas as pd
+import snowflake.connector
+from snowflake.connector import SnowflakeConnection
+
+
+
+session_logger = logging.getLogger('snowflake.snowpark.session')
+session_logger.setLevel(logging.DEBUG)
+
+
+def new_connection(user, password, account, warehouse, database, schema, role=None):
+    """
+    Create new snowflake connection.
+
+    :param user: Service Account username
+    :param password: Service Account password
+    :param account: Which Snowflake account to use
+    :param warehouse: Which Snowflake warehouse to use
+    :param database: Which Snowflake database to use
+    :param schema: Which Snowflake schema to use
+    :return: Connection Object
+    """
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        warehouse=warehouse,
+        database=database,
+        schema=schema,
+        role=role
+    )
+    return conn
+
+
+def fetch_all_rows(query, conn=None, conn_config=None, as_dataframe=False, params=None):
+    """
+    Function to return all rows from a SQL query.
+
+    :param query: Snowflake query to run
+    :param conn: Snowflake existing connection (optional)
+    :param conn_config: Snowflake connection configuration (optional)
+    :param as_dataframe: Return results as a Panda dataframe (optional)
+    :param params: query parameters (optional)
+    :return: List of rows or a dataframe
+    """
+    if not conn:
+        conn = new_connection(**conn_config)
+
+    cur = conn.cursor()
+    cur.execute(query, params)
+    df = cur.fetch_pandas_all()
+    if as_dataframe:
+        return df
+    return df.to_dict(orient='records')
+
+
+def run_query(query, params=None, conn=None, conn_config=None, return_results=False):
+    """
+    Function to run a SQL query .
+
+    :param params: a dictionary containing key value pairs (optional) - e.g. {'id':1} for Query: "select * from clients where id = %(id)s"
+    :param conn: Snowflake existing connection (optional)
+    :param params: query parameters: e.g. (3445)
+    :param conn_config: Snowflake connection configuration (optional)
+    :param return_results: Produce a list of dicts with the resultset of the query
+    :return: None | List[Dict]]
+    """
+    if not conn:
+        conn = new_connection(**conn_config)
+
+    cur = conn.cursor()
+    cur.execute(query, params)
+    if return_results:
+        columns = [col[0] for col in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def run_queries(queries, conn=None, conn_config=None):
+    """
+    Function to run multiple SQL queries.
+
+    :param queries: List of SQL queries to run
+    :param conn: Snowflake existing connection (optional)
+    :param conn_config: Snowflake connection configuration (optional)
+    :return:
+    """
+    if queries is not None:
+        if not conn:
+            conn = new_connection(**conn_config)
+
+        for q in queries:
+            conn.cursor().execute(q)
+
+def stage_file(file_path, stage_name, conn=None, conn_config=None, *args, **kwargs):
+    if not conn:
+        conn = new_connection(**conn_config)
+    logger.info(f'Staging {file_path} into @{stage_name}')
+    # Upload File to Stage
+    conn.cursor().execute(f"PUT file://{file_path}* @{stage_name}".format(
+        file_path=file_path,
+        stage_name=stage_name)
+    )
+
+    return stage_name
+
+
+@timeit
+def load_file_to_table(
+        file_path,
+        format_name,
+        stage_name,
+        table_name,
+        conn=None,
+        keep_raw_files=False
+):
+    """
+    Upload a file to Snowflake table using the Snowflake file format specified.
+
+    Parameters:
+    :param file_path: Local file path.
+    :param format_name: Snowflake FILE FORMAT NAME.
+    :param stage_name: Snowflake STAGE NAME to upload file to.
+    :param table_name: Snowflake TABLE NAME to copy data to from file.
+    :param conn: Existing connection.
+    :param keep_raw_files:
+
+    :return:
+    """
+    if not conn:
+        raise ValueError("Parameter conn is not set!")
+
+    chunks = split_and_compress_row_wise(file_path)
+    for f_path in chunks:
+        stage_name = stage_file(f_path, stage_name, conn)
+
+        logger.info(f'Upload {f_path} to {table_name} ... ')
+        conn.cursor().execute(
+            f"COPY INTO {table_name} "
+            f"FROM @{stage_name} "
+            f"""FILE_FORMAT = (FORMAT_NAME = {format_name});"""
+            .format(
+                table_name=table_name,
+                stage_name=stage_name,
+                format_name=format_name
+            )
+        )
+        if not keep_raw_files:
+            file_name = os.path.basename(f_path)
+            del_q = f"REMOVE @{stage_name} PATTERN='.*{file_name}.*'".format(
+                file_name=file_name,
+                stage_name=stage_name)
+            conn.cursor().execute(del_q)
+            logger.info(del_q)
+        exit(0)
+
+
+
+
+@timeit
+def load_file_to_table_with_csv_format(file_path, stage_name, table_name,
+                                       conn=None, conn_config=None,
+                                       format_options={},
+                                       copy_options={},
+                                       keep_raw_files=False):
+    """
+    Upload a csv file to Snowflake table.
+    For more information about COPY INTO Snowflake options with CSV format go to:
+        https://docs.snowflake.com/en/sql-reference/sql/copy-into-table#type-csv
+    For more information about date/time/timestamp formats in Snowflake go to:
+        https://docs.snowflake.com/en/sql-reference/date-time-input-output
+
+    NOTE: Options with string value must be enclosed by extra single quotes.
+    EXAMPLE:
+    format_options = {
+        'compression': "AUTO",                                  # <-- option is not a string value
+        'field_delimiter': "'|'",                               # <-- extra single quotes
+        'parse_header': False,
+        'skip_header': 0,
+        'date_format': "'YYYY-MM-DD'",                          # <-- extra single quotes
+        'time_format': "'HH24:MI:SS'",                          # <-- extra single quotes
+        'timestamp_format': "'YYYY-MM-DD HH24:MI:SS.FF3'",      # <-- extra single quotes
+        'trim_space': False,
+        'field_optionally_enclosed_by': None,
+        'encoding': "'UTF8'",                                   # <-- extra single quotes
+    }
+    copy_options = {
+        'match_by_column_name': "CASE_INSENSITIVE",             # <-- option is not a string value
+    }
+
+    :param file_path: Local file path
+    :param stage_name: Snowflake STAGE NAME to upload file to
+    :param table_name: Snowflake TABLE NAME to copy data to from csv file
+    :param conn: Existing connection (optional)
+    :param conn_config: Snowflake connection configuration (optional)
+    :param format_options: Format options for the COPY INTO syntax
+    :param copy_options: Copy options for the COPY INTO syntax
+    :param keep_raw_files: Boolean for whether to delete the csv file from the stage after data load is complete
+    :return:
+    """
+    if not conn:
+        conn = new_connection(**conn_config)
+
+    format_options_q = '\n'.join([f"{k.upper()} = {v}" for k, v in format_options.items()])
+    copy_options_q = '\n'.join([f"{k.upper()} = {v}" for k, v in copy_options.items()])
+
+    chunks = split_and_compress_row_wise(file_path)
+    for f_path in chunks:
+        stage_name = stage_file(f_path, stage_name, conn)
+
+        logger.info(f'Upload {f_path} to {table_name} ... ')
+        conn.cursor().execute(
+            f"COPY INTO {table_name} "
+            f"FROM @{stage_name} "
+            f"""FILE_FORMAT = (
+                    TYPE = CSV
+                    {format_options_q})
+                    {copy_options_q};"""
+        )
+        if not keep_raw_files:
+            file_name = os.path.basename(f_path)
+            del_q = f"REMOVE @{stage_name} PATTERN='.*{file_name}.*'"
+            conn.cursor().execute(del_q)
+            logger.info(del_q)
+        exit(0)
+
 
 class SCDHandlerSnowflake():
     """
@@ -387,3 +620,5 @@ if __name__ == '__main__':
     # upsert.scd_type0()
     print(upsert._get_column_types())
     print(upsert.scd_type2())
+
+
